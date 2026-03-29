@@ -24,7 +24,7 @@ def sse_event(data: str, event: str = "message") -> str:
     return f"event: {event}\ndata: {safe}\n\n"
 
 
-async def _stream_sse(prompt: str):
+async def _stream_sse(prompt: str, new_chat: bool = False):
     """
     Async generator yielding SSE-formatted events.
     Events: start → message (chunks) → done | error
@@ -35,7 +35,7 @@ async def _stream_sse(prompt: str):
         yield sse_event(json.dumps({"status": "started"}), event="start")
 
         full_response: list[str] = []
-        async for chunk in gpt_browser.ask_stream(prompt):
+        async for chunk in gpt_browser.ask_stream(prompt, new_chat=new_chat):
             full_response.append(chunk)
             yield sse_event(json.dumps({"delta": chunk}), event="message")
 
@@ -68,7 +68,7 @@ async def ask(body: AskRequest):
 
     try:
         chunks: list[str] = []
-        async for chunk in gpt_browser.ask_stream(body.prompt):
+        async for chunk in gpt_browser.ask_stream(body.prompt, new_chat=body.new_chat):
             chunks.append(chunk)
 
         return AskResponse(status="ok", response="".join(chunks))
@@ -91,7 +91,7 @@ async def ask_stream(body: AskRequest):
         raise HTTPException(status_code=503, detail="Browser not initialised yet")
 
     return StreamingResponse(
-        _stream_sse(body.prompt),
+        _stream_sse(body.prompt, new_chat=body.new_chat),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

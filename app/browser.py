@@ -386,32 +386,36 @@ class ChatGPTBrowser:
 
     # ── Prompt & streaming ─────────────────────────────────────────────────────
 
-    async def ask_stream(self, prompt: str) -> AsyncGenerator[str, None]:
+    async def ask_stream(self, prompt: str, new_chat: bool = False) -> AsyncGenerator[str, None]:
         async with self._lock:
             if not await self._is_browser_alive():
                 await self._recover()
             try:
-                async for chunk in self._do_ask_stream(prompt):
+                async for chunk in self._do_ask_stream(prompt, new_chat):
                     yield chunk
             except Exception as exc:
                 err = str(exc).lower()
                 if "has been closed" in err or "target closed" in err:
                     logger.warning("Browser died mid-stream — recovering and retrying")
                     await self._recover()
-                    async for chunk in self._do_ask_stream(prompt):
+                    async for chunk in self._do_ask_stream(prompt, new_chat):
                         yield chunk
                 else:
                     raise
 
-    async def _do_ask_stream(self, prompt: str) -> AsyncGenerator[str, None]:
+    async def _do_ask_stream(self, prompt: str, new_chat: bool = False) -> AsyncGenerator[str, None]:
         page = self._page
 
-        await page.goto(CHATGPT_NEW, wait_until="domcontentloaded")
-        await page.wait_for_selector(SEL_CHAT_INPUT, state="visible", timeout=30_000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30_000)
-        except PlaywrightTimeout:
-            logger.debug("networkidle timed out on prompt page — continuing")
+        if new_chat or "chatgpt.com" not in page.url.lower():
+            await page.goto(CHATGPT_NEW, wait_until="domcontentloaded")
+            await page.wait_for_selector(SEL_CHAT_INPUT, state="visible", timeout=30_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+            except PlaywrightTimeout:
+                logger.debug("networkidle timed out on prompt page — continuing")
+        else:
+            # Ensure chat input is visible even if we didn't explicitly navigate
+            await page.wait_for_selector(SEL_CHAT_INPUT, state="visible", timeout=10_000)
 
         prior_count = await page.locator(SEL_RESPONSE_BLOCK).count()
 

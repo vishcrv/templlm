@@ -11,6 +11,9 @@ class AskRequest(BaseModel):
         ..., min_length=1, max_length=4000,
         description="The prompt to send to ChatGPT",
     )
+    new_chat: bool = Field(
+        False, description="If true, start a new chat instead of continuing the previous one",
+    )
 
 
 class AskResponse(BaseModel):

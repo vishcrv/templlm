@@ -70,6 +70,12 @@ async function ensureServer() {
   } catch {
     console.log(`${c.yellow}First run — installing dependencies...${c.reset}`);
     try {
+      try {
+        require("child_process").execSync(`${PYTHON} -m pip --version`, { stdio: "ignore" });
+      } catch {
+        console.log(`${c.yellow}Installing pip...${c.reset}`);
+        require("child_process").execSync(`${PYTHON} -m ensurepip --upgrade`, { stdio: "inherit" });
+      }
       require("child_process").execSync(
         `${PYTHON} -m pip install -r requirements.txt --quiet`,
         { stdio: "inherit", cwd: ROOT, timeout: 300000 }
@@ -138,8 +144,8 @@ function post(urlPath, body) {
 
 // ── Streaming response ──────────────────────────────────────────────────────
 
-async function streamResponse(prompt) {
-  const res = await post("/ask/stream", { prompt });
+async function streamResponse(prompt, new_chat = false) {
+  const res = await post("/ask/stream", { prompt, new_chat });
   let event = "";
   let buf   = "";
 
@@ -172,7 +178,7 @@ async function streamResponse(prompt) {
 // ── Interactive REPL ────────────────────────────────────────────────────────
 
 async function repl() {
-  console.log(`${c.bold}${c.cyan}templlm${c.reset} ${c.dim}— ChatGPT in your terminal${c.reset}`);
+  console.log(`${c.bold}${c.cyan}templlm${c.reset} ${c.dim}— LLM in your terminal${c.reset}`);
   console.log(`${c.dim}Type your prompt and press Enter. Ctrl+C to exit.${c.reset}\n`);
 
   const rl = readline.createInterface({
@@ -190,7 +196,7 @@ async function repl() {
 
     try {
       process.stdout.write(`\n${c.cyan}`);
-      await streamResponse(input);
+      await streamResponse(input, false);
       process.stdout.write(`${c.reset}\n`);
     } catch (err) {
       console.error(`\n${c.red}Error: ${err.message}${c.reset}\n`);
@@ -221,17 +227,19 @@ function runSetup() {
 const args = process.argv.slice(2);
 
 if (args[0] === "--help" || args[0] === "-h") {
-  console.log(`${c.bold}templlm${c.reset} — ChatGPT in your terminal\n`);
+  console.log(`${c.bold}templlm${c.reset} — LLM in your terminal\n`);
   console.log("Usage:");
   console.log(`  ${c.cyan}templlm${c.reset}                — interactive chat`);
   console.log(`  ${c.cyan}templlm "prompt"${c.reset}       — one-shot response`);
+  console.log(`  ${c.cyan}templlm status${c.reset}           — check backend server up/down`);
   console.log(`  ${c.cyan}templlm init${c.reset}           — setup wizard`);
-  console.log(`  ${c.cyan}templlm --setup${c.reset}        — re-run ChatGPT login`);
+  console.log(`  ${c.cyan}templlm --setup${c.reset}        — re-run login`);
   process.exit(0);
 }
 
 if (args[0] === "--setup") { runSetup(); process.exit(0); }
 if (args[0] === "init")    { require("../scripts/init.js"); }
+if (args[0] === "status")  { require("../scripts/status.js"); }
 
 else {
   const prompt = args.join(" ");
@@ -239,9 +247,13 @@ else {
   (async () => {
     try {
       await ensureServer();
+      
+      console.log(`\n${c.green}● API is ACTIVE at http://0.0.0.0:8000${c.reset}`);
+      console.log(`${c.dim}  You can now use /ask or /ask/stream in external projects!${c.reset}\n`);
+      
       if (prompt) {
         // One-shot mode
-        await streamResponse(prompt);
+        await streamResponse(prompt, true);
       } else {
         // Interactive REPL
         await repl();

@@ -175,6 +175,12 @@ async function run() {
   const py = detectPython();
   if (py) {
     console.log(`${c.dim}Python:${c.reset}       ${ok} ${py.version}  ${c.dim}(${py.bin})${c.reset}`);
+    try {
+      execSync(`${py.bin} -m pip --version`, { stdio: "ignore" });
+    } catch {
+      console.log(`${c.yellow}Installing pip...${c.reset}`);
+      execSync(`${py.bin} -m ensurepip --upgrade`, { stdio: "inherit" });
+    }
   } else {
     console.log(`${c.dim}Python:${c.reset}       ${err} not found`);
     console.log(`\n${c.yellow}Install Python 3.8+ first:${c.reset}`);

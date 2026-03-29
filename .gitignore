@@ -11,3 +11,5 @@ skills/
 test_*.py
 .vscode/
 context/
+todo/
+.claude/
