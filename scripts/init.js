@@ -3,8 +3,10 @@
 
 const { execSync, spawnSync } = require("child_process");
 const readline = require("readline");
+const os       = require("os");
 const path     = require("path");
 const fs       = require("fs");
+const { detectPython } = require("./python");
 
 const ROOT = path.join(__dirname, "..");
 
@@ -39,26 +41,18 @@ function detectOS() {
   }
 }
 
-// ── Python detection ──────────────────────────────────────────────────────────
-function detectPython() {
-  for (const bin of ["python3", "python"]) {
-    try {
-      const out = execSync(`${bin} --version 2>&1`, { stdio: "pipe" }).toString().trim();
-      const m   = out.match(/Python (\d+\.\d+)/);
-      if (m) return { bin, version: m[1] };
-    } catch {}
-  }
-  return null;
-}
-
 // ── Chrome detection ──────────────────────────────────────────────────────────
 function detectChrome() {
+  const win32 = [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  ];
+  if (process.env.LOCALAPPDATA) {
+    win32.push(path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"));
+  }
+
   const candidates = {
-    win32:  [
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-      "%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe",
-    ],
+    win32,
     darwin: [
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     ],
@@ -74,8 +68,11 @@ function detectChrome() {
   for (const p of (candidates[process.platform] || candidates.linux)) {
     if (fs.existsSync(p)) return p;
   }
+
+  // PATH-based lookup: `where` on Windows, `which` on Unix
+  const lookupCmd = process.platform === "win32" ? "where" : "which";
   for (const bin of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]) {
-    try { execSync(`which ${bin}`, { stdio: "ignore" }); return bin; } catch {}
+    try { execSync(`${lookupCmd} ${bin}`, { stdio: "ignore" }); return bin; } catch {}
   }
   return null;
 }
@@ -110,14 +107,9 @@ function chromeHint({ platform, distro }) {
 }
 
 function chromeDebugCmd(chromePath, { platform }) {
-  const dataDir = platform === "win32"
-    ? "C:\\temp\\chrome-cdp-profile"
-    : "/tmp/chrome-cdp-profile";
+  const dataDir = path.join(os.tmpdir(), "chrome-cdp-profile");
   const chrome  = chromePath.includes(" ") ? `"${chromePath}"` : chromePath;
-  if (platform === "win32") {
-    return `& ${chrome} --remote-debugging-port=9222 --user-data-dir="${dataDir}"`;
-  }
-  return `${chrome} --remote-debugging-port=9222 --user-data-dir=${dataDir}`;
+  return `${chrome} --remote-debugging-port=9222 --user-data-dir="${dataDir}"`;
 }
 
 // ── Readline helper ───────────────────────────────────────────────────────────
@@ -224,12 +216,12 @@ async function run() {
 
     const runSetup = await confirm(rl, "\nRun first-time session setup now? (opens a browser window to log in)");
     if (runSetup) {
-      spawnSync("python", [path.join(ROOT, "cli.py"), "--setup"], { stdio: "inherit", cwd: ROOT });
+      spawnSync(py.bin, [path.join(ROOT, "cli.py"), "--setup"], { stdio: "inherit", cwd: ROOT });
     }
   }
 
   console.log(`\n${c.green}${c.bold}✓ Setup complete!${c.reset}`);
-  console.log(`\nStart the server:  ${c.cyan}python run.py${c.reset}`);
+  console.log(`\nStart the server:  ${c.cyan}${py.bin} run.py${c.reset}`);
   console.log(`Then prompt:       ${c.cyan}templlm "hello"${c.reset}`);
   console.log(`Or streaming:      ${c.cyan}templlm --stream "hello"${c.reset}\n`);
 

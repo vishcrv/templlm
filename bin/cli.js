@@ -1,18 +1,30 @@
 #!/usr/bin/env node
 "use strict";
 
-const http = require("http");
-const net  = require("net");
-const path = require("path");
-const fs   = require("fs");
+const http     = require("http");
+const net      = require("net");
+const path     = require("path");
+const fs       = require("fs");
+const os       = require("os");
+const readline = require("readline");
 const { spawn, spawnSync } = require("child_process");
 
 const HOST     = "127.0.0.1";
 const PORT     = 8000;
 const ENDPOINT = `http://${HOST}:${PORT}`;
 const ROOT     = path.join(__dirname, "..");
+const LOG_FILE = path.join(os.tmpdir(), "templlm-server.log");
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+const { detectPython } = require("../scripts/python");
+const PYTHON = (detectPython() || {}).bin || "python";
+
+// ── Colours ─────────────────────────────────────────────────────────────────
+const c = process.stdout.isTTY ? {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m", red: "\x1b[31m",
+} : { reset:"", bold:"", dim:"", green:"", yellow:"", cyan:"", red:"" };
+
+// ── Network helpers ─────────────────────────────────────────────────────────
 
 function isPortOpen() {
   return new Promise(resolve => {
@@ -22,57 +34,99 @@ function isPortOpen() {
   });
 }
 
-function httpGet(path) {
+function httpGet(urlPath) {
   return new Promise(resolve => {
-    http.get(`${ENDPOINT}${path}`, res => resolve(res.statusCode)).on("error", () => resolve(null));
+    http.get(`${ENDPOINT}${urlPath}`, res => resolve(res.statusCode))
+        .on("error", () => resolve(null));
   });
 }
 
-async function waitForServer(timeoutSecs = 60) {
+async function waitForServer(timeoutSecs = 90) {
   const deadline = Date.now() + timeoutSecs * 1000;
   while (Date.now() < deadline) {
-    if (await httpGet("/docs") !== null) return true;
+    if (await httpGet("/health") !== null) return true;
     await new Promise(r => setTimeout(r, 1000));
   }
   return false;
 }
+
+// ── Server management ───────────────────────────────────────────────────────
 
 async function ensureServer() {
   if (await isPortOpen()) return;
 
   const runPy = path.join(ROOT, "run.py");
   if (!fs.existsSync(runPy)) {
-    console.error("Error: run.py not found next to this package.");
-    console.error("Clone the repo: https://github.com/YOUR_USER/tempLLM");
+    console.error(`${c.red}Error:${c.reset} run.py not found. Reinstall with: npm install -g templlm`);
     process.exit(1);
   }
 
-  process.stderr.write("Starting server");
-  const child = spawn("python", [runPy], {
-    detached: true,
-    stdio:    "ignore",
-    cwd:      ROOT,
+  // Check deps before starting
+  try {
+    require("child_process").execSync(
+      `${PYTHON} -c "import fastapi, uvicorn, playwright"`,
+      { stdio: "pipe", cwd: ROOT, timeout: 10000 }
+    );
+  } catch {
+    console.log(`${c.yellow}First run — installing dependencies...${c.reset}`);
+    try {
+      require("child_process").execSync(
+        `${PYTHON} -m pip install -r requirements.txt --quiet`,
+        { stdio: "inherit", cwd: ROOT, timeout: 300000 }
+      );
+      console.log(`${c.yellow}Installing browser (chromium)...${c.reset}`);
+      require("child_process").execSync(
+        `${PYTHON} -m playwright install chromium`,
+        { stdio: "inherit", cwd: ROOT, timeout: 300000 }
+      );
+    } catch (e) {
+      console.error(`${c.red}Dependency install failed.${c.reset} Run manually:`);
+      console.error(`  ${PYTHON} -m pip install -r requirements.txt`);
+      console.error(`  ${PYTHON} -m playwright install chromium`);
+      process.exit(1);
+    }
+  }
+
+  // Start server with log capture
+  const logFd = fs.openSync(LOG_FILE, "w");
+  const child = spawn(PYTHON, [runPy], {
+    detached:     true,
+    stdio:        ["ignore", logFd, logFd],
+    cwd:          ROOT,
+    windowsHide:  true,
   });
   child.unref();
+  fs.closeSync(logFd);
 
+  process.stderr.write(`${c.dim}Starting server...${c.reset}`);
   const tick = setInterval(() => process.stderr.write("."), 1000);
-  const ready = await waitForServer(60);
+  const ready = await waitForServer(90);
   clearInterval(tick);
   process.stderr.write("\n");
 
   if (!ready) {
-    console.error("Error: server did not become ready within 60 s.");
-    console.error("Run manually in another terminal: python run.py");
+    console.error(`${c.red}Server failed to start.${c.reset}`);
+    // Show last 20 lines of log
+    if (fs.existsSync(LOG_FILE)) {
+      const log = fs.readFileSync(LOG_FILE, "utf8").trim().split("\n").slice(-20).join("\n");
+      if (log) {
+        console.error(`\n${c.dim}── server log ──${c.reset}`);
+        console.error(log);
+        console.error(`${c.dim}── end log ──${c.reset}\n`);
+      }
+    }
+    console.error(`Full log: ${LOG_FILE}`);
     process.exit(1);
   }
 }
+
+// ── HTTP post ───────────────────────────────────────────────────────────────
 
 function post(urlPath, body) {
   return new Promise((resolve, reject) => {
     const data    = JSON.stringify(body);
     const options = {
-      hostname: HOST, port: PORT, path: urlPath,
-      method:  "POST",
+      hostname: HOST, port: PORT, path: urlPath, method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
     };
     const req = http.request(options, resolve);
@@ -82,80 +136,119 @@ function post(urlPath, body) {
   });
 }
 
-// ── Modes ────────────────────────────────────────────────────────────────────
+// ── Streaming response ──────────────────────────────────────────────────────
 
-async function askJson(prompt) {
-  const res = await post("/ask", { prompt });
-  let raw = "";
-  for await (const chunk of res) raw += chunk;
-  const body = JSON.parse(raw);
-  if (body.status === "ok") {
-    process.stdout.write(body.response + "\n");
-  } else {
-    console.error("Error:", body.error);
-    process.exit(1);
-  }
-}
-
-async function askStream(prompt) {
+async function streamResponse(prompt) {
   const res = await post("/ask/stream", { prompt });
   let event = "";
   let buf   = "";
 
-  for await (const chunk of res) {
-    buf += chunk.toString();
-    const lines = buf.split("\n");
-    buf = lines.pop();
+  return new Promise((resolve, reject) => {
+    res.on("data", (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop();
 
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t) continue;
-      if (t.startsWith("event:")) { event = t.slice(6).trim(); continue; }
-      if (!t.startsWith("data:")) continue;
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        if (t.startsWith("event:")) { event = t.slice(6).trim(); continue; }
+        if (!t.startsWith("data:"))  continue;
 
-      let data;
-      try { data = JSON.parse(t.slice(5).trim()); } catch { data = { raw: t.slice(5).trim() }; }
+        let data;
+        try { data = JSON.parse(t.slice(5).trim()); } catch { data = { raw: t.slice(5).trim() }; }
 
-      if      (event === "message") process.stdout.write((data.delta ?? "").replace(/\\n/g, "\n"));
-      else if (event === "done")    { process.stdout.write("\n"); return; }
-      else if (event === "error")   { console.error("\nError:", data.error); process.exit(1); }
-    }
-  }
+        if      (event === "message") process.stdout.write((data.delta ?? "").replace(/\\n/g, "\n"));
+        else if (event === "done")    { process.stdout.write("\n"); resolve(); return; }
+        else if (event === "error")   { reject(new Error(data.error || "Server error")); return; }
+      }
+    });
+
+    res.on("end", resolve);
+    res.on("error", reject);
+  });
 }
+
+// ── Interactive REPL ────────────────────────────────────────────────────────
+
+async function repl() {
+  console.log(`${c.bold}${c.cyan}templlm${c.reset} ${c.dim}— ChatGPT in your terminal${c.reset}`);
+  console.log(`${c.dim}Type your prompt and press Enter. Ctrl+C to exit.${c.reset}\n`);
+
+  const rl = readline.createInterface({
+    input:  process.stdin,
+    output: process.stdout,
+    prompt: `${c.green}> ${c.reset}`,
+  });
+
+  rl.prompt();
+
+  rl.on("line", async (line) => {
+    const input = line.trim();
+    if (!input) { rl.prompt(); return; }
+    if (input === "exit" || input === "quit") { rl.close(); return; }
+
+    try {
+      process.stdout.write(`\n${c.cyan}`);
+      await streamResponse(input);
+      process.stdout.write(`${c.reset}\n`);
+    } catch (err) {
+      console.error(`\n${c.red}Error: ${err.message}${c.reset}\n`);
+    }
+
+    rl.prompt();
+  });
+
+  rl.on("close", () => {
+    console.log(`\n${c.dim}Bye!${c.reset}`);
+    process.exit(0);
+  });
+}
+
+// ── Setup command ───────────────────────────────────────────────────────────
 
 function runSetup() {
   const cliPy = path.join(ROOT, "cli.py");
   if (!fs.existsSync(cliPy)) {
-    console.error("cli.py not found — clone the full repo to run setup.");
+    console.error("cli.py not found — reinstall with: npm install -g templlm");
     process.exit(1);
   }
-  spawnSync("python", [cliPy, "--setup"], { stdio: "inherit", cwd: ROOT });
+  spawnSync(PYTHON, [cliPy, "--setup"], { stdio: "inherit", cwd: ROOT });
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
 
-if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+if (args[0] === "--help" || args[0] === "-h") {
+  console.log(`${c.bold}templlm${c.reset} — ChatGPT in your terminal\n`);
   console.log("Usage:");
-  console.log("  templlm init                — interactive setup wizard");
-  console.log("  templlm <prompt>            — single response");
-  console.log("  templlm --stream <prompt>   — streaming response");
-  console.log("  templlm --setup             — re-run ChatGPT login");
+  console.log(`  ${c.cyan}templlm${c.reset}                — interactive chat`);
+  console.log(`  ${c.cyan}templlm "prompt"${c.reset}       — one-shot response`);
+  console.log(`  ${c.cyan}templlm init${c.reset}           — setup wizard`);
+  console.log(`  ${c.cyan}templlm --setup${c.reset}        — re-run ChatGPT login`);
   process.exit(0);
 }
 
 if (args[0] === "--setup") { runSetup(); process.exit(0); }
-if (args[0] === "init")    { require("../scripts/init.js"); process.exit(0); }
+if (args[0] === "init")    { require("../scripts/init.js"); }
 
-const streamIdx = args.indexOf("--stream");
-const stream    = streamIdx !== -1;
-if (stream) args.splice(streamIdx, 1);
+else {
+  const prompt = args.join(" ");
 
-const prompt = args.join(" ");
-
-(async () => {
-  await ensureServer();
-  if (stream) await askStream(prompt);
-  else        await askJson(prompt);
-})();
+  (async () => {
+    try {
+      await ensureServer();
+      if (prompt) {
+        // One-shot mode
+        await streamResponse(prompt);
+      } else {
+        // Interactive REPL
+        await repl();
+      }
+    } catch (err) {
+      console.error(`${c.red}Error: ${err.message}${c.reset}`);
+      process.exit(1);
+    }
+  })();
+}
