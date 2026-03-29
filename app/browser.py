@@ -30,6 +30,7 @@ from playwright.async_api import (
     Locator,
     TimeoutError as PlaywrightTimeout,
 )
+from playwright_stealth import Stealth
 
 logger = logging.getLogger("browser")
 
@@ -38,7 +39,7 @@ CHATGPT_URL  = "https://chatgpt.com"
 CHATGPT_NEW  = "https://chatgpt.com/?model=auto"   # always starts a fresh chat
 
 # ── Selectors — update if OpenAI changes their DOM ────────────────────────────
-SEL_LOGIN_BUTTON  = "button:has-text('Log in')"
+SEL_LOGIN_BUTTON  = "button[data-testid='login-button'], button:has-text('Log in')"
 SEL_GOOGLE_BUTTON = (
     "[data-provider='google'], "
     "button:has-text('Continue with Google'), "
@@ -53,8 +54,16 @@ SEL_SEND_BUTTON     = "button[data-testid='send-button'], button[aria-label='Sen
 SEL_STOP_BUTTON     = "button[aria-label='Stop streaming'], button[data-testid='stop-button']"
 SEL_RESPONSE_BLOCK  = "div[data-message-author-role='assistant']"
 
+# Elements that ONLY appear when a user is genuinely logged in
+SEL_LOGGED_IN_INDICATOR = (
+    "button[data-testid='profile-button'], "
+    "nav[aria-label='Chat history'], "
+    "div[class*='sidebar'], "
+    "button:has-text('New chat')"
+)
+
 # Block heavy resources that aren't needed for automation — speeds up loads
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
 
 # ── playwright-skill helpers ───────────────────────────────────────────────────
@@ -124,7 +133,6 @@ class ChatGPTBrowser:
         self.response_timeout = response_timeout
 
         self._playwright: Playwright | None  = None
-        self._browser: Browser | None        = None
         self._context: BrowserContext | None = None
         self._page: Page | None              = None
         self._lock = asyncio.Lock()
@@ -134,17 +142,23 @@ class ChatGPTBrowser:
     async def start(self) -> None:
         """Launch browser, configure context, restore or create session."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+        
+        # Use a real user data directory for true persistence
+        user_data_dir = self.session_file.parent / "chrome_profile"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("Launching full persistent context at %s", user_data_dir)
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
             headless=self.headless,
             slow_mo=self.slow_mo,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1280,800"
             ],
-        )
-
-        context_kwargs: dict = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -154,14 +168,6 @@ class ChatGPTBrowser:
             locale="en-US",
             timezone_id="America/New_York",
         )
-
-        if self.session_file.exists():
-            logger.info("Restoring saved session from %s", self.session_file)
-            context_kwargs["storage_state"] = str(self.session_file)
-        else:
-            logger.info("No saved session found; proceeding with fresh Google login")
-
-        self._context = await self._browser.new_context(**context_kwargs)
 
         # Block images / fonts / media — not needed for automation, big speed win
         await self._context.route(
@@ -173,12 +179,14 @@ class ChatGPTBrowser:
             ),
         )
 
-        self._page = await self._context.new_page()
+        # persistent context automatically comes with one page
+        if len(self._context.pages) > 0:
+            self._page = self._context.pages[0]
+        else:
+            self._page = await self._context.new_page()
 
-        # Stealth patch — remove the webdriver fingerprint
-        await self._page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        # Apply stealth patches to bypass Cloudflare and Google detection
+        await Stealth().apply_stealth_async(self._page)
 
         await self._ensure_logged_in()
 
@@ -187,8 +195,6 @@ class ChatGPTBrowser:
         try:
             if self._context:
                 await self._context.close()
-            if self._browser:
-                await self._browser.close()
         finally:
             if self._playwright:
                 await self._playwright.stop()
@@ -200,8 +206,11 @@ class ChatGPTBrowser:
         """Navigate to ChatGPT. Login only if session is missing or expired."""
         logger.info("Navigating to ChatGPT service")
         await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        # networkidle confirms JS has settled — replaces all fixed delays here
-        await self._page.wait_for_load_state("networkidle", timeout=20_000)
+        # networkidle confirms JS has settled — give ChatGPT plenty of time
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=60_000)
+        except PlaywrightTimeout:
+            logger.warning("networkidle timed out loading ChatGPT — continuing")
 
         if await self._is_logged_in():
             logger.info("Existing session valid; skipping login flow")
@@ -210,78 +219,75 @@ class ChatGPTBrowser:
         logger.info("Session invalid or expired; initiating Google OAuth flow")
         await self._do_google_login()
 
-        await self._context.storage_state(path=str(self.session_file))
-        logger.info("Session state persisted to %s", self.session_file)
+        # With persistent contexts, session state is written automatically to the directory.
+        # So we don't need to manually save a json file here.
 
     async def _is_logged_in(self) -> bool:
-        """Return True if the chat input box is present and visible."""
+        """
+        Return True only if the user is genuinely authenticated.
+
+        ChatGPT shows a chat input even to anonymous visitors, so
+        checking for the chatbox alone is NOT enough.  Instead:
+          • Login button visible   → definitely NOT logged in
+          • Profile / sidebar / 'New chat' visible → IS logged in
+        """
         try:
-            await self._page.wait_for_selector(
-                SEL_CHAT_INPUT, state="visible", timeout=6_000
-            )
-            return True
-        except PlaywrightTimeout:
+            # Quick negative check: login button visible = not logged in
+            login_btn = self._page.locator(SEL_LOGIN_BUTTON).first
+            if await login_btn.is_visible():
+                logger.info("Login button detected — user is NOT logged in")
+                return False
+
+            # Positive confirmation: look for logged-in-only indicators
+            indicators = self._page.locator(SEL_LOGGED_IN_INDICATOR)
+            try:
+                await indicators.first.wait_for(state="visible", timeout=5_000)
+                logger.info("Logged-in indicator found — session is valid")
+                return True
+            except PlaywrightTimeout:
+                logger.info("No logged-in indicators found — treating as NOT logged in")
+                return False
+
+        except Exception as exc:
+            logger.warning("_is_logged_in check failed with exception: %s", exc)
             return False
 
     async def _do_google_login(self) -> None:
         """
-        Full Google OAuth flow:
-          1. Click 'Log in' on ChatGPT (if visible)
-          2. Click 'Continue with Google' — opens popup
-          3. Fill email → Next (wait for password screen — condition based)
-          4. Fill password → Sign in
-          5. wait_for_url() for the post-OAuth redirect back to chatgpt.com
+        Since Cloudflare and Google strongly block automated logins, 
+        and we now use a persistent context, we delegate the initial 
+        login to the human user. They only have to do this once.
         """
         page = self._page
 
-        # Step 1 — ChatGPT login button (may already be on /auth/login)
-        login_btn = page.locator(SEL_LOGIN_BUTTON)
-        if await login_btn.is_visible():
-            await safe_click(login_btn)
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-
-        # Step 2 — 'Continue with Google' → Google popup
-        google_btn = page.locator(SEL_GOOGLE_BUTTON)
-        await google_btn.wait_for(state="visible", timeout=12_000)
-
-        async with page.expect_popup() as popup_info:
-            await safe_click(google_btn)
-
-        google_popup: Page = await popup_info.value
-        await google_popup.wait_for_load_state("domcontentloaded")
-        await google_popup.wait_for_load_state("networkidle", timeout=15_000)
-        logger.info("Google OAuth popup ready at %s", google_popup.url)
+        logger.info(" ")
+        logger.info("=========================================================")
+        logger.info(" MANUAL LOGIN REQUIRED (First Run or Expired Session)")
+        logger.info("=========================================================")
+        logger.info("Cloudflare or Google bot detection requires a human.")
+        logger.info("1. Go to the open browser window.")
+        logger.info("2. Manually click 'Log in' and sign in with Google.")
+        logger.info("3. Solve any CAPTCHAs.")
+        logger.info("4. The script will resume automatically once you are in.")
+        logger.info("This session will be saved and reused for future runs.")
+        logger.info("=========================================================")
+        logger.info("Waiting up to 10 minutes for manual login...")
 
         try:
-            # Step 3 — Email
-            email_input = google_popup.locator(SEL_GOOGLE_EMAIL)
-            await safe_fill(email_input, self.google_email)
-            await safe_click(google_popup.locator(SEL_GOOGLE_NEXT))
-
-            # Wait for password field to appear — no fixed delay needed
-            password_input = google_popup.locator(SEL_GOOGLE_PASSWORD)
-            await password_input.wait_for(state="visible", timeout=15_000)
-
-            # Step 4 — Password
-            await safe_fill(password_input, self.google_password)
-            await safe_click(google_popup.locator(SEL_GOOGLE_SIGN_IN))
-
-            # Step 5 — wait_for_url detects the redirect back to ChatGPT cleanly
-            logger.info("Awaiting OAuth redirect resolution")
-            await page.wait_for_url("**chatgpt.com/**", timeout=30_000)
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-
-            # Final confirmation — chat input must be present
-            await page.wait_for_selector(
-                SEL_CHAT_INPUT, state="visible", timeout=15_000
-            )
-            logger.info("Google OAuth login successful; chat input verified")
-
+            # Wait for any of the logged-in indicators to become visible
+            indicators = page.locator(SEL_LOGGED_IN_INDICATOR)
+            await indicators.first.wait_for(state="visible", timeout=600_000)
+            logger.info("✓ Manual login successful! Session saved to persistent context.")
+            
         except Exception:
-            screenshot_path = "/tmp/login-failure.png"
-            await google_popup.screenshot(path=screenshot_path, full_page=True)
+            screenshot_path = "./login-failure.png"
+            try:
+                await page.screenshot(path=screenshot_path, full_page=True)
+            except Exception:
+                logger.warning("Could not capture debug screenshot")
             logger.exception(
-                "Login failure encountered. Debug screenshot saved at %s", screenshot_path
+                "Login failure encountered. Debug screenshot saved at %s",
+                screenshot_path,
             )
             raise
 

@@ -41,7 +41,7 @@ gpt_browser: ChatGPTBrowser | None = None
 async def lifespan(app: FastAPI):
     """Start browser on startup, clean up on shutdown."""
     global gpt_browser
-    logger.info("Launching ChatGPT browser (headless=%s)", HEADLESS)
+    logger.info("launching browser (headless=%s)", HEADLESS)
     gpt_browser = ChatGPTBrowser(
         google_email=GOOGLE_EMAIL,
         google_password=GOOGLE_PASSWORD,
@@ -68,11 +68,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
+'''
+CORS - cross origin resource sharing 
+CORS issue = browser blocking your frontend from calling your backend due to security rules.
+'''
+
+#dev 
+app.add_middleware(             #allows any frontend to call the API without CORS issues 
+                                #only for dev : prod should specify allowed origins
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(ask_router)
+#prod version
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=[
+#         "https://yourdomain.com",
+#         "https://www.yourdomain.com",
+#     ],
+#     allow_credentials=True,
+#     allow_methods=["GET", "POST", "PUT", "DELETE"],  # only what you use
+#     allow_headers=["Authorization", "Content-Type"],
+# )
+
+app.include_router(ask_router)   #endpoints plugged (/ask and /ask/stream)
