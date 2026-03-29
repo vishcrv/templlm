@@ -1,33 +1,53 @@
 """
 browser.py — Playwright automation for ChatGPT
-Handles three connection modes:
 
-  MODE A  CDP_URL set
-          Connect to an already-running Chrome via Chrome DevTools Protocol.
-          No login flow — you stay logged in as long as Chrome is open.
-          Best for local dev and Playwright MCP setups.
+Two connection modes, selected automatically at startup:
 
-  MODE B  USER_DATA_DIR set
-          Playwright launches Chromium but stores its profile in a real directory
-          on disk.  Cookies / local-storage survive restarts automatically.
-          First run: set HEADLESS=false and log in manually once.
+  MODE A  CDP_URL is set AND Chrome is actually reachable
+          ─────────────────────────────────────────────────
+          A lightweight HTTP probe hits /json/version before Playwright
+          is involved. If the port is closed the probe fails in <5 ms
+          and we skip straight to Mode B — no long Playwright timeouts.
 
-  MODE C  Neither set  (original behaviour)
-          Fresh Chromium + Google OAuth, then saves a session.json.
-          Requires GOOGLE_EMAIL + GOOGLE_PASSWORD in .env.
+          Launch Chrome once (keep the window open):
+
+            Windows (PowerShell):
+              & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+                --remote-debugging-port=9222 `
+                --user-data-dir=C:\temp\chrome-cdp-profile
+
+            macOS / Linux:
+              google-chrome --remote-debugging-port=9222 \
+                --user-data-dir=/tmp/chrome-cdp-profile
+
+          Log in to ChatGPT in that window, then start this server.
+
+  MODE B  CDP_URL not set  OR  Chrome not reachable  (automatic fallback)
+          ──────────────────────────────────────────────────────────────
+          Playwright launches a fresh Chromium, restores session.json if
+          it exists, and navigates to ChatGPT.
+          No login flow is ever attempted. If ChatGPT is not authenticated
+          the server raises immediately with a debug screenshot.
+
+Cross-platform (Windows + Linux):
+  • HTTP probe uses only stdlib — zero extra deps
+  • Platform-specific Chromium launch args (Linux sandbox flags omitted on Windows)
+  • Screenshot paths use ./ (works on both OSes)
 
 Best practices (playwright-skill):
   • Zero fixed wait_for_timeout() calls — all waits are condition-based
   • wait_for_load_state("networkidle") after every navigation
-  • wait_for_url() for redirect detection
   • safeClick() + safeFill() helpers with retry
-  • Network request blocking (images/fonts/media) for speed in MODE B/C
+  • Named route handler (no lambda closure surprises)
   • try/finally everywhere to guarantee browser cleanup
   • Debug screenshots auto-saved on failures
 """
 
 import asyncio
 import logging
+import platform
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -38,32 +58,80 @@ from playwright.async_api import (
     Page,
     Playwright,
     Locator,
+    Route,
     TimeoutError as PlaywrightTimeout,
 )
 
 logger = logging.getLogger("browser")
 
 # ── URLs ───────────────────────────────────────────────────────────────────────
-CHATGPT_URL  = "https://chatgpt.com"
-CHATGPT_NEW  = "https://chatgpt.com/?model=auto"
+CHATGPT_URL = "https://chatgpt.com"
+CHATGPT_NEW = "https://chatgpt.com/?model=auto"
 
 # ── Selectors ─────────────────────────────────────────────────────────────────
-SEL_LOGIN_BUTTON  = "button:has-text('Log in')"
-SEL_GOOGLE_BUTTON = (
-    "[data-provider='google'], "
-    "button:has-text('Continue with Google'), "
-    "a:has-text('Continue with Google')"
-)
-SEL_GOOGLE_EMAIL    = "input[type='email']"
-SEL_GOOGLE_NEXT     = "#identifierNext, button:has-text('Next')"
-SEL_GOOGLE_PASSWORD = "input[type='password']"
-SEL_GOOGLE_SIGN_IN  = "#passwordNext, button:has-text('Next')"
-SEL_CHAT_INPUT      = "#prompt-textarea, div[contenteditable='true'][data-id='root']"
-SEL_SEND_BUTTON     = "button[data-testid='send-button'], button[aria-label='Send prompt']"
-SEL_STOP_BUTTON     = "button[aria-label='Stop streaming'], button[data-testid='stop-button']"
-SEL_RESPONSE_BLOCK  = "div[data-message-author-role='assistant']"
+SEL_CHAT_INPUT     = "#prompt-textarea, div[contenteditable='true'][data-id='root']"
+SEL_SEND_BUTTON    = "button[data-testid='send-button'], button[aria-label='Send prompt']"
+SEL_STOP_BUTTON    = "button[aria-label='Stop streaming'], button[data-testid='stop-button']"
+SEL_RESPONSE_BLOCK = "div[data-message-author-role='assistant']"
 
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+
+IS_WINDOWS = platform.system() == "Windows"
+
+
+# ── HTTP pre-flight probe ──────────────────────────────────────────────────────
+
+async def _cdp_is_reachable(cdp_url: str, timeout: float = 2.0) -> bool:
+    """
+    Probe Chrome's CDP /json/version endpoint with a plain HTTP GET.
+
+    Completes in <5 ms when Chrome is not running (immediate connection
+    refused) — no Playwright connection attempt, no long timeout.
+    Returns True only when Chrome is up and answering on that port.
+    """
+    probe = cdp_url.rstrip("/") + "/json/version"
+    loop  = asyncio.get_event_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: urllib.request.urlopen(probe, timeout=timeout),
+            ),
+            timeout=timeout + 0.5,
+        )
+        logger.debug("CDP probe OK — Chrome reachable at %s", probe)
+        return True
+    except Exception as exc:
+        logger.debug("CDP probe failed (%s): %s", probe, exc)
+        return False
+
+
+# ── Cross-platform Chromium launch args ───────────────────────────────────────
+
+def _chromium_args() -> list[str]:
+    """
+    Return platform-appropriate Chromium flags.
+    --no-sandbox / --disable-dev-shm-usage are Linux-only; on Windows they
+    can prevent the browser window from appearing.
+    """
+    args = ["--disable-blink-features=AutomationControlled"]
+    if not IS_WINDOWS:
+        args += [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+    return args
+
+
+# ── Route handler ─────────────────────────────────────────────────────────────
+
+async def _block_heavy_resources(route: Route) -> None:
+    """Named handler — avoids async lambda closure surprises."""
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 # ── playwright-skill helpers ───────────────────────────────────────────────────
@@ -105,100 +173,102 @@ class ChatGPTBrowser:
     """
     Single persistent Playwright session for ChatGPT.
     asyncio.Lock serialises concurrent /ask requests.
+
+    Startup decision tree
+    ─────────────────────
+    CDP_URL set?
+      ├─ YES → probe /json/version (HTTP, <5 ms)
+      │          ├─ reachable  → Mode A (CDP connect)
+      │          │               └─ still fails? → Mode B
+      │          └─ unreachable → Mode B (no wait)
+      └─ NO  → Mode B directly
     """
 
     def __init__(
         self,
-        google_email: str = "",
-        google_password: str = "",
         session_file: str = "./session.json",
         headless: bool = True,
         slow_mo: int = 0,
         response_timeout: int = 120,
-        # ── New connection-mode params ──────────────────────────────────────
-        cdp_url: str = "",        # MODE A — e.g. "http://localhost:9222"
-        user_data_dir: str = "",  # MODE B — e.g. "/home/you/.config/chatgpt-profile"
+        cdp_url: str = "",
     ):
-        self.google_email    = google_email
-        self.google_password = google_password
-        self.session_file    = Path(session_file)
-        self.headless        = headless
-        self.slow_mo         = slow_mo
+        self.session_file     = Path(session_file)
+        self.headless         = headless
+        self.slow_mo          = slow_mo
         self.response_timeout = response_timeout
-        self.cdp_url         = cdp_url
-        self.user_data_dir   = user_data_dir
+        self.cdp_url          = cdp_url
 
         self._playwright: Playwright | None  = None
         self._browser: Browser | None        = None
         self._context: BrowserContext | None = None
         self._page: Page | None              = None
         self._lock = asyncio.Lock()
-
-        # Determine active mode for logging
-        if cdp_url:
-            self._mode = "A-CDP"
-        elif user_data_dir:
-            self._mode = "B-PersistentProfile"
-        else:
-            self._mode = "C-OAuth"
+        self._mode = "pending"
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Launch / connect browser according to active mode."""
         self._playwright = await async_playwright().start()
 
-        if self._mode == "A-CDP":
-            await self._start_cdp()
-        elif self._mode == "B-PersistentProfile":
-            await self._start_persistent_profile()
-        else:
-            await self._start_oauth()
+        if self.cdp_url:
+            if await _cdp_is_reachable(self.cdp_url):
+                try:
+                    await self._start_cdp()
+                    self._mode = "A-CDP"
+                    logger.info("Browser ready — mode A (CDP at %s)", self.cdp_url)
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "Mode A: Chrome reachable but connection failed (%s) "
+                        "— falling back to Mode B",
+                        exc,
+                    )
+                    await self._cleanup_browser()
+            else:
+                logger.info(
+                    "Mode A: Chrome not reachable at %s — skipping straight to Mode B",
+                    self.cdp_url,
+                )
 
-        logger.info("Browser ready in mode %s", self._mode)
+        self._mode = "B-Fallback"
+        await self._start_fallback()
+        logger.info(
+            "Browser ready — mode B (Chromium, headless=%s, platform=%s)",
+            self.headless,
+            platform.system(),
+        )
+
+    # ── Shared cleanup ─────────────────────────────────────────────────────────
+
+    async def _cleanup_browser(self) -> None:
+        """Close context + browser without touching _playwright."""
+        for obj, name in [(self._context, "context"), (self._browser, "browser")]:
+            if obj is not None:
+                try:
+                    await obj.close()
+                except Exception as exc:
+                    logger.debug("cleanup %s: %s", name, exc)
+        self._context = None
+        self._browser = None
+        self._page    = None
 
     # ── Mode A — CDP ───────────────────────────────────────────────────────────
 
     async def _start_cdp(self) -> None:
-        """
-        Connect to an already-running Chrome instance via CDP.
-
-        How to launch that Chrome (do this ONCE, then keep it open):
-
-            Windows:
-              "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" ^
-                --remote-debugging-port=9222 ^
-                --user-data-dir=C:\\temp\\chrome-cdp-profile
-
-            macOS:
-              /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
-                --remote-debugging-port=9222 \\
-                --user-data-dir=/tmp/chrome-cdp-profile
-
-            Linux:
-              google-chrome --remote-debugging-port=9222 \\
-                --user-data-dir=/tmp/chrome-cdp-profile
-
-        Log in to ChatGPT manually in that window, then start this server.
-        From that point on, no login flow ever runs.
-        """
-        logger.info("MODE A — connecting to existing Chrome via CDP at %s", self.cdp_url)
+        logger.info("MODE A — connecting via CDP at %s", self.cdp_url)
         self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
 
-        # Reuse the first (existing) browser context — that's the logged-in one
         contexts = self._browser.contexts
         if contexts:
             self._context = contexts[0]
-            logger.info("Reusing existing browser context (already logged in)")
+            logger.info("Reusing existing browser context")
         else:
             self._context = await self._browser.new_context()
-            logger.warning("No existing context found; created a fresh one — login may be required")
+            logger.warning("No existing context — created fresh one; login may be required")
 
-        # Reuse an existing page if available, otherwise open a new one
-        pages = self._context.pages
+        pages      = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
 
-        # Verify we're already logged in — navigate to ChatGPT if not already there
         if "chatgpt.com" not in self._page.url:
             await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
             await self._page.wait_for_load_state("networkidle", timeout=20_000)
@@ -209,88 +279,22 @@ class ChatGPTBrowser:
                 "Open that Chrome window, navigate to chatgpt.com, log in manually, "
                 "then restart this server."
             )
-        logger.info("CDP connection confirmed — ChatGPT session is active")
 
-    # ── Mode B — Persistent profile ────────────────────────────────────────────
+        logger.info("CDP connection confirmed — ChatGPT session active")
 
-    async def _start_persistent_profile(self) -> None:
-        """
-        Launch Chromium with a real persistent user-data directory.
-        Cookies and local-storage survive process restarts automatically.
+    # ── Mode B — Fallback ──────────────────────────────────────────────────────
 
-        First run: set HEADLESS=false in .env so you can log in manually.
-        Subsequent runs: HEADLESS=true works fine — already authenticated.
-        """
-        logger.info("MODE B — launching with persistent profile at %s", self.user_data_dir)
-
-        # launch_persistent_context combines browser launch + context creation
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            self.user_data_dir,
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            timezone_id="America/New_York",
+    async def _start_fallback(self) -> None:
+        logger.info(
+            "MODE B — launching Chromium (headless=%s, platform=%s)",
+            self.headless,
+            platform.system(),
         )
 
-        # Block heavy resources — big speed win
-        await self._context.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in BLOCKED_RESOURCE_TYPES
-                else route.continue_()
-            ),
-        )
-
-        # launch_persistent_context doesn't expose a separate Browser object
-        self._browser = None
-
-        pages = self._context.pages
-        self._page = pages[0] if pages else await self._context.new_page()
-        await self._page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-
-        await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle", timeout=20_000)
-
-        if not await self._is_logged_in():
-            if self.headless:
-                raise RuntimeError(
-                    "Persistent profile is not logged in and HEADLESS=true.\n"
-                    "Set HEADLESS=false, restart, and log in manually once."
-                )
-            logger.info("Not logged in — waiting for manual login (HEADLESS=false)")
-            # Wait up to 3 minutes for a human to log in
-            await self._page.wait_for_selector(SEL_CHAT_INPUT, state="visible", timeout=180_000)
-            logger.info("Manual login detected — profile will persist this session")
-        else:
-            logger.info("Persistent profile already authenticated")
-
-    # ── Mode C — OAuth (original) ──────────────────────────────────────────────
-
-    async def _start_oauth(self) -> None:
-        """Original behaviour: fresh Chromium + Google OAuth + session.json cache."""
-        logger.info("MODE C — launching fresh Chromium with Google OAuth")
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
             slow_mo=self.slow_mo,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=_chromium_args(),
         )
 
         context_kwargs: dict = dict(
@@ -305,57 +309,46 @@ class ChatGPTBrowser:
         )
 
         if self.session_file.exists():
-            logger.info("Restoring saved session from %s", self.session_file)
+            logger.info("Restoring session from %s", self.session_file)
             context_kwargs["storage_state"] = str(self.session_file)
         else:
-            logger.info("No saved session found; proceeding with fresh Google login")
+            logger.info("No session.json found — proceeding without stored cookies")
 
         self._context = await self._browser.new_context(**context_kwargs)
-
-        await self._context.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in BLOCKED_RESOURCE_TYPES
-                else route.continue_()
-            ),
-        )
+        await self._context.route("**/*", _block_heavy_resources)
 
         self._page = await self._context.new_page()
         await self._page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        await self._ensure_logged_in()
+        await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
+        await self._page.wait_for_load_state("networkidle", timeout=20_000)
 
-    # ── Shared teardown ────────────────────────────────────────────────────────
+        if not await self._is_logged_in():
+            screenshot = "./session-required.png"
+            await self._page.screenshot(path=screenshot, full_page=True)
+            raise RuntimeError(
+                "ChatGPT is not authenticated in fallback mode.\n"
+                "Options:\n"
+                "  1. Set CDP_URL in .env and log in to ChatGPT in that Chrome window (Mode A).\n"
+                "  2. Place a valid session.json next to this project (Mode B with cookies).\n"
+                f"Screenshot saved → {screenshot}"
+            )
+
+        logger.info("Fallback mode — ChatGPT session verified")
+
+    # ── Teardown ───────────────────────────────────────────────────────────────
 
     async def stop(self) -> None:
-        """Graceful teardown — works for all three modes."""
         try:
-            if self._context:
-                await self._context.close()
-            if self._browser:
-                await self._browser.close()
+            await self._cleanup_browser()
         finally:
             if self._playwright:
                 await self._playwright.stop()
             logger.info("Browser closed cleanly (mode %s)", self._mode)
 
-    # ── Login (Mode C only) ────────────────────────────────────────────────────
-
-    async def _ensure_logged_in(self) -> None:
-        await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle", timeout=20_000)
-
-        if await self._is_logged_in():
-            logger.info("Existing session valid; skipping login flow")
-            return
-
-        logger.info("Session invalid or expired; initiating Google OAuth flow")
-        await self._do_google_login()
-        await self._context.storage_state(path=str(self.session_file))
-        logger.info("Session state persisted to %s", self.session_file)
+    # ── Session check ──────────────────────────────────────────────────────────
 
     async def _is_logged_in(self) -> bool:
         try:
@@ -365,46 +358,6 @@ class ChatGPTBrowser:
             return True
         except PlaywrightTimeout:
             return False
-
-    async def _do_google_login(self) -> None:
-        page = self._page
-
-        login_btn = page.locator(SEL_LOGIN_BUTTON)
-        if await login_btn.is_visible():
-            await safe_click(login_btn)
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-
-        google_btn = page.locator(SEL_GOOGLE_BUTTON)
-        await google_btn.wait_for(state="visible", timeout=12_000)
-
-        async with page.expect_popup() as popup_info:
-            await safe_click(google_btn)
-
-        google_popup: Page = await popup_info.value
-        await google_popup.wait_for_load_state("domcontentloaded")
-        await google_popup.wait_for_load_state("networkidle", timeout=15_000)
-
-        try:
-            email_input = google_popup.locator(SEL_GOOGLE_EMAIL)
-            await safe_fill(email_input, self.google_email)
-            await safe_click(google_popup.locator(SEL_GOOGLE_NEXT))
-
-            password_input = google_popup.locator(SEL_GOOGLE_PASSWORD)
-            await password_input.wait_for(state="visible", timeout=15_000)
-
-            await safe_fill(password_input, self.google_password)
-            await safe_click(google_popup.locator(SEL_GOOGLE_SIGN_IN))
-
-            await page.wait_for_url("**chatgpt.com/**", timeout=30_000)
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-            await page.wait_for_selector(SEL_CHAT_INPUT, state="visible", timeout=15_000)
-            logger.info("Google OAuth login successful")
-
-        except Exception:
-            screenshot_path = "/tmp/login-failure.png"
-            await google_popup.screenshot(path=screenshot_path, full_page=True)
-            logger.exception("Login failure. Screenshot saved at %s", screenshot_path)
-            raise
 
     # ── Prompt & streaming ─────────────────────────────────────────────────────
 
@@ -432,7 +385,7 @@ class ChatGPTBrowser:
             logger.debug("Send button not clickable — using Enter key")
             await chat_input.press("Enter")
 
-        logger.info("Prompt submitted (length: %d chars)", len(prompt))
+        logger.info("Prompt submitted (%d chars)", len(prompt))
 
         await page.locator(SEL_RESPONSE_BLOCK).nth(prior_count).wait_for(
             state="attached", timeout=15_000
@@ -470,8 +423,9 @@ class ChatGPTBrowser:
 
         except PlaywrightTimeout as exc:
             logger.error("Timeout in stream loop: %s", exc)
-            await page.screenshot(path="/tmp/stream-timeout.png", full_page=True)
-            yield "\n\n[Error: Playwright timed out — screenshot at /tmp/stream-timeout.png]"
+            screenshot = "./stream-timeout.png"
+            await page.screenshot(path=screenshot, full_page=True)
+            yield f"\n\n[Error: Playwright timed out — screenshot saved to {screenshot}]"
             return
 
         except Exception as exc:
@@ -496,13 +450,13 @@ class ChatGPTBrowser:
 
     # ── Utility ────────────────────────────────────────────────────────────────
 
-    async def screenshot(self, path: str = "/tmp/chatgpt-debug.png") -> str:
+    async def screenshot(self, path: str = "./chatgpt-debug.png") -> str:
         await self._page.screenshot(path=path, full_page=True)
         logger.info("Screenshot saved at: %s", path)
         return path
 
     async def invalidate_session(self) -> None:
-        """Mode C only — delete persisted session.json."""
+        """Delete persisted session.json (Mode B only)."""
         if self.session_file.exists():
             self.session_file.unlink()
-            logger.info("session.json cleared — re-auth required on next start")
+            logger.info("session.json cleared")

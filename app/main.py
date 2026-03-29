@@ -9,14 +9,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
-    GOOGLE_EMAIL,
-    GOOGLE_PASSWORD,
     SESSION_FILE,
     HEADLESS,
     SLOW_MO,
     RESPONSE_TIMEOUT,
     CDP_URL,
-    USER_DATA_DIR,
 )
 from app.browser import ChatGPTBrowser
 from app.routes.ask import router as ask_router
@@ -34,22 +31,15 @@ gpt_browser: ChatGPTBrowser | None = None
 async def lifespan(app: FastAPI):
     global gpt_browser
 
-    mode = (
-        "A-CDP" if CDP_URL
-        else "B-PersistentProfile" if USER_DATA_DIR
-        else "C-OAuth"
-    )
+    mode = "A-CDP" if CDP_URL else "B-Fallback"
     logger.info("Launching ChatGPT browser — mode=%s headless=%s", mode, HEADLESS)
 
     gpt_browser = ChatGPTBrowser(
-        google_email=GOOGLE_EMAIL,
-        google_password=GOOGLE_PASSWORD,
         session_file=SESSION_FILE,
         headless=HEADLESS,
         slow_mo=SLOW_MO,
         response_timeout=RESPONSE_TIMEOUT,
         cdp_url=CDP_URL,
-        user_data_dir=USER_DATA_DIR,
     )
     await gpt_browser.start()
     logger.info("Browser ready")
@@ -61,10 +51,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ChatGPT Scraper API",
     description=(
-        "JSON + SSE-streaming endpoints that scrape ChatGPT responses "
-        "via Playwright. Supports CDP, persistent-profile, and OAuth modes."
+        "JSON + SSE-streaming endpoints that scrape ChatGPT via Playwright. "
+        "Mode A: CDP (recommended). Mode B: fresh Chromium, no login."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
