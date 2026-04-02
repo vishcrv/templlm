@@ -6,6 +6,8 @@
 
 spin up a local server · hit clean REST endpoints · get responses
 
+[![npm version](https://img.shields.io/npm/v/templlm)](https://www.npmjs.com/package/templlm)
+
 </div>
 
 ---
@@ -32,45 +34,42 @@ templlm "prompt"  →  POST /ask  →  FastAPI server  →  Playwright  →  Cha
 
 ## install
 
-### option A — npm (recommended)
+templlm is published on npm — no cloning required.
 
 ```bash
 npm install -g templlm
-templlm init        # interactive setup wizard
 ```
 
-### option B — clone the repo
+Dependencies (Python packages + Playwright browser) are installed automatically. Once done you'll see:
+
+```
+✓ Ready!
+
+Get started:
+  templlm init      ← run this first to set up your browser & login
+  templlm --help    ← all commands
+```
+
+Then run the setup wizard:
 
 ```bash
-git clone https://github.com/YOUR_USER/tempLLM.git
+templlm init
+```
+
+### install from source
+
+```bash
+git clone https://github.com/vishcrv/tempLLM.git
 cd tempLLM
-npm install         # installs pip packages + playwright chromium automatically
-npm install -g .    # puts `templlm` in your PATH
-templlm init        # interactive setup wizard
+npm install -g .
+templlm init
 ```
 
----
+### updating
 
-## setup wizard
-
-`templlm init` detects your OS and walks you through everything:
-
+```bash
+npm update -g templlm
 ```
-┌────────────────────────────────────────┐
-│          templlm  ·  setup wizard       │
-└────────────────────────────────────────┘
-
-Detected OS:  Linux (Arch Linux)
-Python:       ✓ 3.11.0  (python3)
-
-Which connection mode?
-  1  Mode A — CDP  (recommended)  Connect to your own Chrome with an active session
-  2  Mode B — Headless            Playwright launches Chromium in the background
-
-›
-```
-
-It then prints the exact Chrome launch command for your OS, writes `.env` automatically, and optionally runs the login flow.
 
 ---
 
@@ -110,7 +109,6 @@ source ~/.bashrc   # or open a new terminal
 <summary><strong>macOS</strong></summary>
 
 ```bash
-# Install prerequisites via Homebrew
 brew install python node
 brew install --cask google-chrome    # for Mode A (CDP)
 
@@ -124,7 +122,6 @@ templlm init
 <summary><strong>Windows</strong></summary>
 
 ```powershell
-# Install prerequisites via winget
 winget install Python.Python.3
 winget install OpenJS.NodeJS
 winget install Google.Chrome        # for Mode A (CDP)
@@ -133,7 +130,7 @@ npm install -g templlm
 templlm init
 ```
 
-Or use [Chocolatey](https://chocolatey.org/):
+Or via [Chocolatey](https://chocolatey.org/):
 
 ```powershell
 choco install python nodejs googlechrome
@@ -152,16 +149,42 @@ npm config set prefix "$env:APPDATA\npm"
 
 ---
 
-## usage
+## commands
 
 ```bash
-templlm init                          # first-time setup
-templlm "give me a bubble sort"       # single response
-templlm --stream "explain async/await"  # streaming response
-templlm --setup                       # re-run login (session expired)
+templlm init                    # first-time setup wizard (mode + browser + login)
+templlm setup                   # re-run login wizard (session expired)
+templlm "your prompt"           # one-shot prompt — always opens a new chat
+templlm                         # interactive REPL — context retained across messages
+templlm status                  # check API status, start or stop the server
+templlm stop                    # kill the background server (+ browser in CDP mode)
+templlm logs                    # tail the server log file live
+templlm --version               # print installed version
+templlm --help                  # show all commands and examples
 ```
 
-The server starts automatically in the background when you run a prompt. No need to run `python run.py` manually.
+The server starts automatically in the background when you send a prompt. No need to run `python run.py` manually.
+
+---
+
+## setup wizard
+
+`templlm init` detects your OS and walks you through everything:
+
+```
+┌────────────────────────────────────────┐
+│          templlm  ·  setup wizard       │
+└────────────────────────────────────────┘
+
+Detected OS:  Windows
+Python:       ✓ 3.12  (python3)
+
+Which connection mode?
+  1  Mode A — CDP  (recommended)  Connect to your own Chrome with an active session
+  2  Mode B — Headless            Playwright launches Chromium in the background
+```
+
+It launches Chrome with remote debugging, waits for you to log in, then writes `.env` automatically.
 
 ---
 
@@ -169,9 +192,7 @@ The server starts automatically in the background when you run a prompt. No need
 
 ### mode A — CDP (recommended)
 
-Connect to your existing Chrome with a live logged-in session.
-
-**1. Launch Chrome with remote debugging:**
+Connect to your existing Chrome with a live logged-in session. `templlm init` handles launching Chrome for you. To do it manually:
 
 <details>
 <summary>Linux</summary>
@@ -203,15 +224,13 @@ google-chrome-stable --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-cd
 
 </details>
 
-**2. Log in to ChatGPT in that window.**
+Log in to ChatGPT in that window, then run `templlm init` or set `CDP_URL=http://localhost:9222` in `.env`.
 
-**3. Run `templlm init` or set `CDP_URL=http://localhost:9222` in `.env`.**
-
-> The Chrome profile is saved to `--user-data-dir` — you only log in once.
+> The Chrome profile is saved — you only log in once.
 
 ### mode B — headless
 
-Don't open Chrome. Just run `templlm "prompt"` and Playwright handles its own Chromium. Session is limited to unauthenticated access unless you have a saved `session.json`.
+No Chrome needed. Playwright manages its own Chromium in the background. Session is limited to unauthenticated access unless you have a saved `session.json`.
 
 ---
 
@@ -231,8 +250,6 @@ Interactive docs → `http://localhost:8000/docs`
 
 ## test the api
 
-### curl
-
 ```bash
 # Linux / macOS
 curl -X POST http://127.0.0.1:8000/ask \
@@ -247,11 +264,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/ask `
   -Body '{"prompt": "give me a bubble sort"}'
 ```
 
-### python test client (no extra installs)
-
 ```bash
+# Python test client
 python test_client.py "give me a bubble sort"
-python test_client.py --stream "give me a bubble sort"
 ```
 
 ---
@@ -288,15 +303,17 @@ tempLLM/
 │       └── ask.py       endpoints
 │
 ├── bin/
-│   └── cli.js           npm CLI entry point
+│   └── cli.js           CLI entry point
 │
 ├── scripts/
-│   ├── init.js          interactive setup wizard
-│   └── postinstall.js   runs on npm install
+│   ├── init.js          setup wizard (templlm init / setup)
+│   ├── status.js        status + supervisor (templlm status)
+│   ├── browser.js       Chrome detection + CDP launch
+│   ├── deps.js          Python dependency installer
+│   ├── python.js        Python binary detection
+│   └── postinstall.js   runs on npm install -g
 │
 ├── run.py               server entry point
-├── cli.py               direct browser CLI (no server)
-├── test_client.py       HTTP test client
 ├── requirements.txt     Python dependencies
 └── package.json         npm package
 ```
