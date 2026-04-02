@@ -1,6 +1,6 @@
 {
   "name": "templlm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Use any LLM right from your terminal — powered by a local Playwright server",
   "author": "vishcrv",
   "license": "MIT",

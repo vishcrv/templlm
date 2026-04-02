@@ -7,25 +7,26 @@ const path     = require("path");
 const fs       = require("fs");
 const os       = require("os");
 const readline = require("readline");
-const { spawn, spawnSync } = require("child_process");
+const { spawn }          = require("child_process");
+const { detectPython }   = require("../scripts/python");
+const { getMode, ensureBrowser } = require("../scripts/browser");
+const { ensureDeps }     = require("../scripts/deps");
+const { version }        = require("../package.json");
 
 const HOST     = "127.0.0.1";
 const PORT     = 8000;
 const ENDPOINT = `http://${HOST}:${PORT}`;
 const ROOT     = path.join(__dirname, "..");
 const LOG_FILE = path.join(os.tmpdir(), "templlm-server.log");
+const PYTHON   = (detectPython() || {}).bin || "python";
 
-const { detectPython } = require("../scripts/python");
-const { getMode, ensureBrowser } = require("../scripts/browser");
-const PYTHON = (detectPython() || {}).bin || "python";
-
-// ── Colours ─────────────────────────────────────────────────────────────────
+// ── Colours ──────────────────────────────────────────────────────────────────
 const c = process.stdout.isTTY ? {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m", red: "\x1b[31m",
 } : { reset:"", bold:"", dim:"", green:"", yellow:"", cyan:"", red:"" };
 
-// ── Network helpers ─────────────────────────────────────────────────────────
+// ── Network helpers ───────────────────────────────────────────────────────────
 
 function isPortOpen() {
   return new Promise(resolve => {
@@ -51,56 +52,25 @@ async function waitForServer(timeoutSecs = 90) {
   return false;
 }
 
-// ── Server management ───────────────────────────────────────────────────────
+// ── Server management ─────────────────────────────────────────────────────────
 
 async function ensureServer() {
   if (await isPortOpen()) return;
 
   const runPy = path.join(ROOT, "run.py");
   if (!fs.existsSync(runPy)) {
-    console.error(`${c.red}Error:${c.reset} run.py not found. Reinstall with: npm install -g templlm`);
+    console.error(`${c.red}Error:${c.reset} run.py not found. Reinstall: npm install -g templlm`);
     process.exit(1);
   }
 
-  // Check deps before starting
-  try {
-    require("child_process").execSync(
-      `${PYTHON} -c "import fastapi, uvicorn, playwright"`,
-      { stdio: "pipe", cwd: ROOT, timeout: 10000 }
-    );
-  } catch {
-    console.log(`${c.yellow}First run — installing dependencies...${c.reset}`);
-    try {
-      try {
-        require("child_process").execSync(`${PYTHON} -m pip --version`, { stdio: "ignore" });
-      } catch {
-        console.log(`${c.yellow}Installing pip...${c.reset}`);
-        require("child_process").execSync(`${PYTHON} -m ensurepip --upgrade`, { stdio: "inherit" });
-      }
-      require("child_process").execSync(
-        `${PYTHON} -m pip install -r requirements.txt --quiet`,
-        { stdio: "inherit", cwd: ROOT, timeout: 300000 }
-      );
-      console.log(`${c.yellow}Installing browser (chromium)...${c.reset}`);
-      require("child_process").execSync(
-        `${PYTHON} -m playwright install chromium`,
-        { stdio: "inherit", cwd: ROOT, timeout: 300000 }
-      );
-    } catch (e) {
-      console.error(`${c.red}Dependency install failed.${c.reset} Run manually:`);
-      console.error(`  ${PYTHON} -m pip install -r requirements.txt`);
-      console.error(`  ${PYTHON} -m playwright install chromium`);
-      process.exit(1);
-    }
-  }
+  ensureDeps(PYTHON, c);
 
-  // Start server with log capture
   const logFd = fs.openSync(LOG_FILE, "w");
   const child = spawn(PYTHON, [runPy], {
-    detached:     true,
-    stdio:        ["ignore", logFd, logFd],
-    cwd:          ROOT,
-    windowsHide:  true,
+    detached:    true,
+    stdio:       ["ignore", logFd, logFd],
+    cwd:         ROOT,
+    windowsHide: true,
   });
   child.unref();
   fs.closeSync(logFd);
@@ -113,37 +83,32 @@ async function ensureServer() {
 
   if (!ready) {
     console.error(`${c.red}Server failed to start.${c.reset}`);
-    // Show last 20 lines of log
     if (fs.existsSync(LOG_FILE)) {
       const log = fs.readFileSync(LOG_FILE, "utf8").trim().split("\n").slice(-20).join("\n");
       if (log) {
         console.error(`\n${c.dim}── server log ──${c.reset}`);
         console.error(log);
-        console.error(`${c.dim}── end log ──${c.reset}\n`);
+        console.error(`${c.dim}────────────────${c.reset}\n`);
       }
     }
-    console.error(`Full log: ${LOG_FILE}`);
+    console.error(`Full log: ${c.dim}${LOG_FILE}${c.reset}`);
     process.exit(1);
   }
 }
 
-// ── Backend bootstrap (server + browser) ───────────────────────────────────
-
 async function ensureBackend() {
   const mode = getMode();
   if (mode === "cdp") {
-    process.stderr.write(`${c.dim}Checking browser...${c.reset}\n`);
     const ok = await ensureBrowser();
     if (!ok) {
-      console.error(`${c.red}CDP mode configured but Chrome not found.${c.reset} Run \`templlm init\` to reconfigure.`);
+      console.error(`${c.red}CDP mode set but Chrome not found.${c.reset} Run \`templlm init\` to reconfigure.`);
       process.exit(1);
     }
-    process.stderr.write(`${c.dim}Browser ready.${c.reset}\n`);
   }
   await ensureServer();
 }
 
-// ── HTTP post ───────────────────────────────────────────────────────────────
+// ── HTTP post ─────────────────────────────────────────────────────────────────
 
 function post(urlPath, body) {
   return new Promise((resolve, reject) => {
@@ -159,7 +124,7 @@ function post(urlPath, body) {
   });
 }
 
-// ── Streaming response ──────────────────────────────────────────────────────
+// ── Streaming response ────────────────────────────────────────────────────────
 
 async function streamResponse(prompt, new_chat = false) {
   const res = await post("/ask/stream", { prompt, new_chat });
@@ -167,7 +132,7 @@ async function streamResponse(prompt, new_chat = false) {
   let buf   = "";
 
   return new Promise((resolve, reject) => {
-    res.on("data", (chunk) => {
+    res.on("data", chunk => {
       buf += chunk.toString();
       const lines = buf.split("\n");
       buf = lines.pop();
@@ -192,11 +157,10 @@ async function streamResponse(prompt, new_chat = false) {
   });
 }
 
-// ── Interactive REPL ────────────────────────────────────────────────────────
+// ── Interactive REPL ──────────────────────────────────────────────────────────
 
 async function repl() {
-  console.log(`${c.bold}${c.cyan}templlm${c.reset} ${c.dim}— LLM in your terminal${c.reset}`);
-  console.log(`${c.dim}Type your prompt and press Enter. Ctrl+C to exit.${c.reset}\n`);
+  console.log(`${c.bold}${c.cyan}templlm${c.reset} ${c.dim}— type a prompt and press Enter · Ctrl+C to exit${c.reset}\n`);
 
   const rl = readline.createInterface({
     input:  process.stdin,
@@ -204,21 +168,24 @@ async function repl() {
     prompt: `${c.green}> ${c.reset}`,
   });
 
+  let firstMessage = true;
   rl.prompt();
 
-  rl.on("line", async (line) => {
+  rl.on("line", async line => {
     const input = line.trim();
     if (!input) { rl.prompt(); return; }
     if (input === "exit" || input === "quit") { rl.close(); return; }
 
+    rl.pause();
     try {
       process.stdout.write(`\n${c.cyan}`);
-      await streamResponse(input, false);
+      await streamResponse(input, firstMessage);
+      firstMessage = false;
       process.stdout.write(`${c.reset}\n`);
     } catch (err) {
       console.error(`\n${c.red}Error: ${err.message}${c.reset}\n`);
     }
-
+    rl.resume();
     rl.prompt();
   });
 
@@ -228,38 +195,119 @@ async function repl() {
   });
 }
 
-// ── Entry point ─────────────────────────────────────────────────────────────
+// ── Help ──────────────────────────────────────────────────────────────────────
+
+function showHelp() {
+  console.log(`
+${c.bold}${c.cyan}templlm${c.reset} v${version} — LLM in your terminal
+
+${c.bold}Usage:${c.reset}
+  ${c.cyan}templlm init${c.reset}              First-time setup wizard (choose mode, open browser)
+  ${c.cyan}templlm setup${c.reset}             Re-run login flow (session expired)
+  ${c.cyan}templlm "prompt"${c.reset}          Send a one-shot prompt (opens a new chat)
+  ${c.cyan}templlm${c.reset}                   Interactive REPL — context retained across messages
+  ${c.cyan}templlm status${c.reset}            Check API status / start or stop the server
+  ${c.cyan}templlm stop${c.reset}              Kill the background server (and browser if CDP mode)
+  ${c.cyan}templlm logs${c.reset}              Tail the server log file
+  ${c.cyan}templlm --version${c.reset}         Print version
+  ${c.cyan}templlm --help${c.reset}            Show this help
+
+${c.bold}Examples:${c.reset}
+  templlm init
+  templlm "summarise this file: $(cat README.md)"
+  templlm
+  templlm stop
+`);
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+
+function tailLogs() {
+  if (!fs.existsSync(LOG_FILE)) {
+    console.log(`${c.dim}No log file found. Start the server first.${c.reset}`);
+    return;
+  }
+
+  process.stdout.write(fs.readFileSync(LOG_FILE, "utf8"));
+
+  let size = fs.statSync(LOG_FILE).size;
+  console.log(`\n${c.dim}─── watching for new output (Ctrl+C to exit) ───${c.reset}`);
+
+  const watcher = fs.watch(LOG_FILE, () => {
+    try {
+      const newSize = fs.statSync(LOG_FILE).size;
+      if (newSize <= size) return;
+      const fd  = fs.openSync(LOG_FILE, "r");
+      const buf = Buffer.alloc(newSize - size);
+      fs.readSync(fd, buf, 0, buf.length, size);
+      fs.closeSync(fd);
+      process.stdout.write(buf.toString());
+      size = newSize;
+    } catch {}
+  });
+
+  process.on("SIGINT", () => { watcher.close(); process.exit(0); });
+}
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
+
+async function stopAll() {
+  // Defer to status.js's exported helpers to avoid duplication
+  const { stopAll: _stop } = require("../scripts/status");
+  const mode = getMode();
+  await _stop(mode);
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
+const cmd  = args[0];
 
-if (args[0] === "--help" || args[0] === "-h") {
-  console.log(`${c.bold}templlm${c.reset} — LLM in your terminal\n`);
-  console.log("Usage:");
-  console.log(`  ${c.cyan}templlm${c.reset}                — interactive chat`);
-  console.log(`  ${c.cyan}templlm "prompt"${c.reset}       — one-shot response`);
-  console.log(`  ${c.cyan}templlm status${c.reset}         — check / manage backend`);
-  console.log(`  ${c.cyan}templlm init${c.reset}           — first-time setup wizard`);
+if (cmd === "--help" || cmd === "-h") {
+  showHelp();
   process.exit(0);
 }
 
-if (args[0] === "init")   { require("../scripts/init.js"); }
-if (args[0] === "status") { require("../scripts/status.js"); }
+if (cmd === "--version" || cmd === "-v") {
+  console.log(`templlm v${version}`);
+  process.exit(0);
+}
 
-else {
+if (cmd === "init" || cmd === "setup") {
+  // init.js exports nothing — auto-runs on require, which is intentional
+  require("../scripts/init.js");
+
+} else if (cmd === "status") {
+  const { run } = require("../scripts/status.js");
+  run().catch(e => { console.error(e.message); process.exit(1); });
+
+} else if (cmd === "stop") {
+  (async () => {
+    await stopAll();
+    process.exit(0);
+  })();
+
+} else if (cmd === "logs") {
+  tailLogs();
+
+} else {
+  // One-shot prompt or interactive REPL
+  const envPath = path.join(ROOT, ".env");
+  if (!fs.existsSync(envPath)) {
+    console.log(`\n${c.bold}Welcome to templlm!${c.reset}`);
+    console.log(`Run ${c.cyan}templlm init${c.reset} first to set things up.\n`);
+    process.exit(0);
+  }
+
   const prompt = args.join(" ");
 
   (async () => {
     try {
       await ensureBackend();
 
-      console.log(`\n${c.green}● API is ACTIVE at http://0.0.0.0:8000${c.reset}`);
-      console.log(`${c.dim}  You can now use /ask or /ask/stream in external projects!${c.reset}\n`);
-      
       if (prompt) {
-        // One-shot mode
         await streamResponse(prompt, true);
       } else {
-        // Interactive REPL
         await repl();
       }
     } catch (err) {
