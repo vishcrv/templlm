@@ -1,7 +1,7 @@
 <div align="center">
   <br />
   <h1>tempLLM</h1>
-  <p><strong>a free, local LLM API — no key, no cost, no SDK.</strong></p>
+  <p><strong>a free, LLM - local API no key, no cost, no SDK.</strong></p>
   <p>Spin up a server once. Hit REST endpoints from any project, any language, forever.</p>
   <br />
 
